@@ -6,9 +6,77 @@ import (
 	"net/rpc"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// replicateLogEntry sends a single log entry to all peers and waits for majority replication.
+func (n *RaftNode) replicateLogEntry(entry LogEntry) bool {
+	n.mu.Lock()
+	if n.role != Leader {
+		n.mu.Unlock()
+		log.Printf("[%s] replicateLogEntry called but not leader\n", n.ID)
+		return false
+	}
+	term := n.persistent.CurrentTerm
+	n.mu.Unlock()
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	successCount := 1 // leader itself counts
+	totalPeers := len(n.Peers)
+	majority := (totalPeers+1)/2 + 1
+
+	for _, peerAddr := range n.Peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+
+			client, err := rpc.Dial("tcp", peer)
+			if err != nil {
+				return
+			}
+			defer client.Close()
+
+			args := AppendEntriesArgs{
+				Term:     term,
+				LeaderID: n.ID,
+				Entries:  []LogEntry{entry},
+			}
+			var reply AppendEntriesReply
+
+			// set timeout context manually
+			done := make(chan error, 1)
+			go func() { done <- client.Call("RaftRPC.AppendEntries", args, &reply) }()
+			select {
+			case err = <-done:
+			case <-time.After(1 * time.Second):
+				err = rpc.ErrShutdown
+			}
+			if err != nil {
+				return
+			}
+
+			if reply.Success {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+				log.Printf("[%s] replication to %s succeeded (count=%d/%d required=%d)",
+					n.ID, peer, successCount, totalPeers+1, majority)
+			}
+		}(peerAddr)
+	}
+
+	wg.Wait()
+
+	if successCount >= majority {
+		log.Printf("[%s] committed up to index %d", n.ID, entry.Index)
+		return true
+	}
+	log.Printf("[%s] replication failed for index %d (%d/%d)", n.ID, entry.Index, successCount, totalPeers+1)
+	return false
+}
 
 // replicateLogEntries broadcasts the given entries to all followers.
 // Returns true if the entry(ies) reach majority and leader advances commitIndex.
@@ -143,7 +211,7 @@ func (n *RaftNode) applyEntries() {
 				if err != nil {
 					log.Printf("[%s] invalid register port: %s\n", n.ID, portStr)
 				} else {
-					// always update leader's Workers immediately
+					// persistently add/update worker info
 					n.Workers[workerID] = WorkerInfo{ID: workerID, Host: host, Port: port}
 					n.WorkerLastSeen[workerID] = time.Now()
 					log.Printf("[%s] Applied register: %s -> %s:%d\n", n.ID, workerID, host, port)
@@ -163,6 +231,7 @@ func (n *RaftNode) applyEntries() {
 				workerID := parts[4]
 				portStr := parts[5]
 
+				// run deployment asynchronously
 				n.mu.Unlock()
 				go func(user, site, fileURL, workerID, portStr string) {
 					n.mu.Lock()
@@ -198,7 +267,7 @@ func (n *RaftNode) applyEntries() {
 			}
 		}
 
-		// send to applyCh (non-blocking)
+		// ---- Send to applyCh (non-blocking) ----
 		select {
 		case n.applyCh <- entry:
 		default:

@@ -16,17 +16,23 @@ func (r *RaftRPC) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRepl
 	reply.Success = false
 	reply.MatchIndex = 0
 
-	// 1) Reply false if term < currentTerm
-	if args.Term < n.persistent.CurrentTerm {
-		return nil
-	}
-
-	// 2) If leader's term is newer, update and become follower
+	// 1) Step down if term higher
 	if args.Term > n.persistent.CurrentTerm {
 		n.persistent.CurrentTerm = args.Term
 		n.persistent.VotedFor = ""
 		n.role = Follower
+		n.leaderID = args.LeaderID
+		_ = n.persistState()
+		log.Printf("[%s] stepping down, new leader=%s term=%d\n", n.ID, args.LeaderID, args.Term)
 	}
+
+	// 2) Only accept heartbeat from current or higher term leader
+	if args.Term < n.persistent.CurrentTerm {
+		return nil
+	}
+
+	// 3) reset election timer immediately
+	n.heartbeatCh <- true
 	n.leaderID = args.LeaderID
 
 	// reset election timer
@@ -104,46 +110,41 @@ func (r *RaftRPC) SubmitCommand(args SubmitCommandArgs, reply *SubmitCommandRepl
 	n := r.node
 	n.mu.Lock()
 	isLeader := n.role == Leader
-	leaderID := n.leaderID
 	n.mu.Unlock()
 
 	if !isLeader {
 		reply.Success = false
-		reply.LeaderID = leaderID
+		reply.LeaderID = n.leaderID
 		reply.Message = "not leader"
 		return nil
 	}
 
-	// append to leader log
-	n.mu.Lock()
-	newIndex := 1
-	if len(n.persistent.Log) > 0 {
-		newIndex = n.persistent.Log[len(n.persistent.Log)-1].Index + 1
-	}
+	// append registration command to log
 	entry := LogEntry{
-		Index:   newIndex,
+		Index:   len(n.persistent.Log) + 1,
 		Term:    n.persistent.CurrentTerm,
-		Command: args.Command,
+		Command: args.Command, // could be "register|workerID|host|port"
 	}
+
+	n.mu.Lock()
 	n.persistent.Log = append(n.persistent.Log, entry)
 	n.mu.Unlock()
 
-	// replicate and wait majority
-	ok := n.replicateLogEntries([]LogEntry{entry})
+	// replicate asynchronously
+	go func() {
+		ok := n.replicateLogEntry(entry)
+		if ok {
+			n.mu.Lock()
+			n.volatile.commitIndex = entry.Index
+			n.mu.Unlock()
+			n.applyEntries()
+			log.Printf("[%s] committed worker registration: %s", n.ID, args.Command)
+		}
+	}()
 
-	if ok {
-		reply.Success = true
-		reply.Message = "committed"
-	} else {
-		// still apply locally even if majority fails
-		n.applyEntries()
-		reply.Success = true
-		reply.Message = "applied locally (majority not reached)"
-	}
-
-	n.mu.Lock()
+	reply.Success = true
 	reply.LeaderID = n.ID
-	n.mu.Unlock()
+	reply.Message = "log accepted"
 	return nil
 }
 
@@ -168,31 +169,42 @@ type ListWorkersReply struct {
 
 // WorkerHeartbeat RPC: workers call this frequently.
 // If this node is leader, it updates WorkerLastSeen (volatile). If not leader, it returns LeaderID empty (or known)
+var workerStates = make(map[string]*WorkerState) // key: workerID
+
 func (r *RaftRPC) WorkerHeartbeat(args WorkerHeartbeatArgs, reply *WorkerHeartbeatReply) error {
 	n := r.node
 	n.mu.Lock()
-	isLeader := n.role == Leader
-	leaderID := n.leaderID
-	n.mu.Unlock()
+	defer n.mu.Unlock()
 
-	if !isLeader {
+	if n.role != Leader {
+		// Tell worker who the current leader is
 		reply.Success = false
-		reply.LeaderID = leaderID
+		reply.LeaderID = n.leaderID
 		reply.Message = "not leader"
 		return nil
 	}
 
-	// leader accepts heartbeat: update volatile last-seen and mark alive
-	n.mu.Lock()
-	n.WorkerLastSeen[args.WorkerID] = time.Now()
-	// if worker not in persisted registry (Workers), ignore — worker should register via SubmitCommand first
-	if _, ok := n.Workers[args.WorkerID]; !ok {
-		// optionally log
-		log.Printf("[%s] heartbeat received from unknown worker %s (host=%s:%d)\n", n.ID, args.WorkerID, args.Host, args.Port)
-	} else {
-		log.Printf("[%s] heartbeat accepted from worker %s\n", n.ID, args.WorkerID)
+	// Leader accepts heartbeat
+	state, ok := workerStates[args.WorkerID]
+	if !ok {
+		state = &WorkerState{LeaderID: n.ID, SuccessCount: 0}
+		workerStates[args.WorkerID] = state
 	}
-	n.mu.Unlock()
+
+	if state.LeaderID == n.ID {
+		state.SuccessCount++
+	} else {
+		state.LeaderID = n.ID
+		state.SuccessCount = 1
+	}
+
+	// Only mark worker as "trusting this leader" after 2 consecutive heartbeats
+	if state.SuccessCount >= 2 {
+		n.WorkerLastSeen[args.WorkerID] = time.Now()
+		if _, ok := n.Workers[args.WorkerID]; ok {
+			log.Printf("[%s] heartbeat accepted from worker %s\n", n.ID, args.WorkerID)
+		}
+	}
 
 	reply.Success = true
 	reply.LeaderID = n.ID

@@ -79,7 +79,6 @@ type WorkerInfo struct {
 
 // Volatile worker state (not persisted)
 type WorkerState struct {
-	Info     WorkerInfo
-	LastSeen time.Time
-	Status   string // e.g., "alive", "dead"
+	LeaderID     string
+	SuccessCount int
 }

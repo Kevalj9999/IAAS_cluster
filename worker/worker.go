@@ -30,7 +30,6 @@ type WorkerHeartbeatReply struct {
 
 var debug bool
 
-// dialRPC returns an *rpc.Client with dial timeout
 func dialRPC(addr string, timeout time.Duration) (*rpc.Client, error) {
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
@@ -39,18 +38,13 @@ func dialRPC(addr string, timeout time.Duration) (*rpc.Client, error) {
 	return rpc.NewClient(conn), nil
 }
 
-// callWithTimeout performs client.Call but returns error if timeout exceeded.
 func callWithTimeout(client *rpc.Client, serviceMethod string, args interface{}, reply interface{}, timeout time.Duration) error {
 	done := make(chan error, 1)
-	go func() {
-		err := client.Call(serviceMethod, args, reply)
-		done <- err
-	}()
+	go func() { done <- client.Call(serviceMethod, args, reply) }()
 	select {
 	case err := <-done:
 		return err
 	case <-time.After(timeout):
-		// best effort close
 		_ = client.Close()
 		return fmt.Errorf("rpc call timeout after %s", timeout)
 	}
@@ -64,10 +58,8 @@ func main() {
 	flag.BoolVar(&debug, "debug", true, "enable debug logs")
 	flag.Parse()
 
-	// start background servers
 	go startWorkerRPC("./sites", *port)
 
-	// normalize peers
 	controlPeers := []string{}
 	for _, p := range strings.Split(*control, ",") {
 		p = strings.TrimSpace(p)
@@ -80,17 +72,17 @@ func main() {
 	}
 	log.Printf("[worker %s] control peers: %v", *id, controlPeers)
 
-	// registration command (use '|' delimiter)
 	registerCmd := fmt.Sprintf("register|%s|%s|%d", *id, *host, *port)
-
-	var knownLeaderAddr string // only keep if it's host:port
-
+	var knownLeaderAddr string
+	successCount := 0
 	registered := false
+
 	for !registered {
 		tryPeers := controlPeers
 		if knownLeaderAddr != "" {
 			tryPeers = append([]string{knownLeaderAddr}, tryPeers...)
 		}
+
 		for _, peer := range tryPeers {
 			if debug {
 				log.Printf("[worker %s] dialing %s for registration", *id, peer)
@@ -105,8 +97,7 @@ func main() {
 
 			args := SubmitCommandArgs{Command: registerCmd}
 			var reply SubmitCommandReply
-			// Make call with a timeout so worker doesn't block forever
-			err = callWithTimeout(client, "RaftRPC.SubmitCommand", args, &reply, 1200*time.Millisecond)
+			err = callWithTimeout(client, "RaftRPC.SubmitCommand", args, &reply, 3*time.Second)
 			_ = client.Close()
 			if err != nil {
 				if debug {
@@ -115,28 +106,27 @@ func main() {
 				continue
 			}
 
-			// If reply includes a hint that looks like an address (host:port), use it
-			if reply.LeaderID != "" && strings.Contains(reply.LeaderID, ":") {
-				knownLeaderAddr = reply.LeaderID
+			// Update knownLeaderAddr from host:port if reply message contains it
+			if reply.Success && strings.Contains(reply.Message, "log accepted") {
+				knownLeaderAddr = peer
 				if debug {
-					log.Printf("[worker %s] learned leader address %s", *id, knownLeaderAddr)
+					log.Printf("[worker %s] registration accepted via %s", *id, peer)
 				}
-			}
-
-			if reply.Success {
-				log.Printf("[worker %s] registration accepted (via %s): %s", *id, peer, reply.Message)
 				registered = true
 				break
-			} else {
-				log.Printf("[worker %s] submit to %s not leader (leader=%s) msg=%s", *id, peer, reply.LeaderID, reply.Message)
+			} else if !reply.Success && reply.LeaderID != "" {
+				knownLeaderAddr = reply.LeaderID
+				if debug {
+					log.Printf("[worker %s] learned leader %s", *id, knownLeaderAddr)
+				}
 			}
 		}
+
 		if !registered {
 			time.Sleep(800 * time.Millisecond)
 		}
 	}
 
-	// give leader a moment to apply registration
 	time.Sleep(300 * time.Millisecond)
 	log.Printf("[worker %s] starting heartbeat loop (knownLeader=%s)", *id, knownLeaderAddr)
 
@@ -147,42 +137,31 @@ func main() {
 		if knownLeaderAddr != "" {
 			tryPeers = append([]string{knownLeaderAddr}, tryPeers...)
 		}
-		success := false
+
 		for _, peer := range tryPeers {
-			if debug {
-				log.Printf("[worker %s] dialing %s for heartbeat", *id, peer)
-			}
 			client, err := dialRPC(peer, 2*time.Second)
 			if err != nil {
-				if debug {
-					log.Printf("[worker %s] heartbeat dial %s failed: %v", *id, peer, err)
-				}
 				continue
 			}
 			args := WorkerHeartbeatArgs{WorkerID: *id, Host: *host, Port: *port}
 			var hbReply WorkerHeartbeatReply
 			err = callWithTimeout(client, "RaftRPC.WorkerHeartbeat", args, &hbReply, 3*time.Second)
 			_ = client.Close()
-			if err != nil {
-				if debug {
-					log.Printf("[worker %s] heartbeat call to %s failed: %v", *id, peer, err)
-				}
+			if err != nil || !hbReply.Success {
 				continue
 			}
-			// update known leader address if reply contains host:port
-			if hbReply.LeaderID != "" && strings.Contains(hbReply.LeaderID, ":") {
-				knownLeaderAddr = hbReply.LeaderID
-			}
-			if hbReply.Success {
-				log.Printf("[worker %s] heartbeat accepted by leader %s (via %s)", *id, hbReply.LeaderID, peer)
-				success = true
-				break
+
+			if hbReply.LeaderID == knownLeaderAddr {
+				successCount++
 			} else {
-				log.Printf("[worker %s] heartbeat refused by %s (leader=%s) msg=%s", *id, peer, hbReply.LeaderID, hbReply.Message)
+				knownLeaderAddr = hbReply.LeaderID
+				successCount = 1
 			}
-		}
-		if !success {
-			log.Printf("[worker %s] heartbeat: no leader accepted this tick (knownLeader=%s)", *id, knownLeaderAddr)
+
+			if successCount >= 2 {
+				log.Printf("[worker %s] leader confirmed: %s\n", *id, knownLeaderAddr)
+			}
+			break
 		}
 	}
 }
