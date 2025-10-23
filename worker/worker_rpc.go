@@ -36,8 +36,7 @@ type WorkerRPC struct {
 // Utility functions
 // ====================
 
-// downloadToTemp downloads a given URL to a temporary local zip file.
-// It retries a few times and validates HTTP status code and file size.
+// downloadToTemp downloads a given URL to a temporary local zip file
 func downloadToTemp(url string) (string, error) {
 	const maxAttempts = 3
 	var lastErr error
@@ -52,10 +51,9 @@ func downloadToTemp(url string) (string, error) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			//bodySnippet := ""
 			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("attempt %d: bad status %d", attempt, resp.StatusCode)
-			log.Printf("[worker] download attempt %d returned status %d for %s\n", attempt, resp.StatusCode, url)
+			log.Printf("[worker] download attempt %d returned status %d\n", attempt, resp.StatusCode)
 			time.Sleep(300 * time.Millisecond)
 			continue
 		}
@@ -102,7 +100,6 @@ func unzip(src, destDir string) error {
 	defer r.Close()
 
 	for _, f := range r.File {
-		// Prevent ZipSlip vulnerability
 		fpath := filepath.Join(destDir, f.Name)
 		if !strings.HasPrefix(fpath, filepath.Clean(destDir)+string(os.PathSeparator)) {
 			return fmt.Errorf("invalid file path in zip: %s", fpath)
@@ -139,7 +136,7 @@ func unzip(src, destDir string) error {
 	return nil
 }
 
-// listFiles logs files in the target directory (useful to verify extraction)
+// listFiles logs files in the target directory
 func listFiles(dir string, max int) {
 	i := 0
 	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
@@ -170,7 +167,7 @@ func (w *WorkerRPC) AssignDeployment(args AssignDeploymentArgs, reply *AssignDep
 		base = "./sites"
 	}
 
-	// ensure sanitize user/site (basic)
+	// sanitize user/site
 	user := filepath.Clean(args.User)
 	site := filepath.Clean(args.Site)
 	if user == "." || site == "." || strings.Contains(user, "..") || strings.Contains(site, "..") {
@@ -194,25 +191,15 @@ func (w *WorkerRPC) AssignDeployment(args AssignDeploymentArgs, reply *AssignDep
 		log.Printf("[worker] ERROR download: %v\n", err)
 		return nil
 	}
-	// ensure temp file removed
-	defer func() {
-		if tmpZip != "" {
-			os.Remove(tmpZip)
-		}
-	}()
+	defer os.Remove(tmpZip)
 
-	// unzip into a temporary directory first, then move into targetDir to avoid partial deployments
 	tmpExtractDir, err := os.MkdirTemp("", "site_extract_*")
 	if err != nil {
 		reply.Success = false
 		reply.Message = fmt.Sprintf("temp extract dir creation failed: %v", err)
-		log.Printf("[worker] ERROR tmp dir: %v\n", err)
 		return nil
 	}
-	// cleanup temp extract on exit
-	defer func() {
-		_ = os.RemoveAll(tmpExtractDir)
-	}()
+	defer os.RemoveAll(tmpExtractDir)
 
 	if err := unzip(tmpZip, tmpExtractDir); err != nil {
 		reply.Success = false
@@ -221,22 +208,16 @@ func (w *WorkerRPC) AssignDeployment(args AssignDeploymentArgs, reply *AssignDep
 		return nil
 	}
 
-	// Optional: remove old targetDir contents before moving new (atomic replace)
 	backupDir := targetDir + ".old"
 	_ = os.RemoveAll(backupDir)
-	// move current to backup
 	_ = os.Rename(targetDir, backupDir)
-	// create fresh target
 	if err := os.MkdirAll(targetDir, 0o755); err != nil {
-		// Attempt to roll back
 		_ = os.Rename(backupDir, targetDir)
 		reply.Success = false
 		reply.Message = fmt.Sprintf("mkdir target failed: %v", err)
-		log.Printf("[worker] ERROR mkdir target: %v\n", err)
 		return nil
 	}
 
-	// move extracted files into targetDir
 	err = filepath.Walk(tmpExtractDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -249,15 +230,12 @@ func (w *WorkerRPC) AssignDeployment(args AssignDeploymentArgs, reply *AssignDep
 		if info.IsDir() {
 			return os.MkdirAll(destPath, os.ModePerm)
 		}
-		// ensure parent exists
 		if err := os.MkdirAll(filepath.Dir(destPath), os.ModePerm); err != nil {
 			return err
 		}
-		// move (rename) where possible, otherwise copy
 		if err := os.Rename(path, destPath); err == nil {
 			return nil
 		}
-		// fallback to copy
 		src, err := os.Open(path)
 		if err != nil {
 			return err
@@ -272,20 +250,14 @@ func (w *WorkerRPC) AssignDeployment(args AssignDeploymentArgs, reply *AssignDep
 		return err
 	})
 	if err != nil {
-		// rollback
 		_ = os.RemoveAll(targetDir)
 		_ = os.Rename(backupDir, targetDir)
 		reply.Success = false
 		reply.Message = fmt.Sprintf("deploy move error: %v", err)
-		log.Printf("[worker] ERROR move extracted files: %v\n", err)
 		return nil
 	}
 
-	// remove backup on successful replace
 	_ = os.RemoveAll(backupDir)
-
-	// log contents so operator can verify
-	log.Printf("[worker] Assigned site %s/%s -> %s (listing up to 100 files):\n", user, site, targetDir)
 	listFiles(targetDir, 100)
 
 	reply.Success = true
@@ -298,20 +270,18 @@ func (w *WorkerRPC) AssignDeployment(args AssignDeploymentArgs, reply *AssignDep
 // Worker startup
 // ====================
 
-// startWorkerRPC runs both RPC and HTTP servers for the worker
+// startWorkerRPC runs RPC and HTTP servers for the worker
 func startWorkerRPC(baseDir string, httpPort int) {
-	// Ensure baseDir exists
 	if baseDir == "" {
 		baseDir = "./sites"
 	}
 	_ = os.MkdirAll(baseDir, 0o755)
 
-	// 1️⃣ Start RPC server (on httpPort + 1000)
+	// RPC server (httpPort + 1000)
 	rpcSrv := rpc.NewServer()
 	if err := rpcSrv.Register(&WorkerRPC{BasePath: baseDir}); err != nil {
 		log.Fatalf("WorkerRPC register error: %v", err)
 	}
-
 	rpcPort := httpPort + 1000
 	l, err := net.Listen("tcp", fmt.Sprintf(":%d", rpcPort))
 	if err != nil {
@@ -320,11 +290,10 @@ func startWorkerRPC(baseDir string, httpPort int) {
 	log.Printf("[worker] RPC listening on %d\n", rpcPort)
 	go rpcSrv.Accept(l)
 
-	// 2️⃣ Serve static files over HTTP using a local mux (avoid global http.Handle)
+	// HTTP server for serving static files
 	mux := http.NewServeMux()
 	fileHandler := http.FileServer(http.Dir(baseDir))
 	mux.Handle("/", fileHandler)
-
 	addr := fmt.Sprintf(":%d", httpPort)
 	log.Printf("[worker] Serving HTTP on %s (baseDir=%s)\n", addr, baseDir)
 	go func() {
