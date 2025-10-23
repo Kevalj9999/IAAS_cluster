@@ -198,7 +198,7 @@ func (n *RaftNode) applyEntries() {
 
 		cmd := entry.Command
 
-		// ---- Worker registration ----
+		// ---- Worker registration (applied on ALL nodes) ----
 		if strings.HasPrefix(cmd, "register|") {
 			parts := strings.SplitN(cmd, "|", 4)
 			if len(parts) != 4 {
@@ -206,12 +206,10 @@ func (n *RaftNode) applyEntries() {
 			} else {
 				workerID := parts[1]
 				host := parts[2]
-				portStr := parts[3]
-				port, err := strconv.Atoi(portStr)
+				port, err := strconv.Atoi(parts[3])
 				if err != nil {
-					log.Printf("[%s] invalid register port: %s\n", n.ID, portStr)
+					log.Printf("[%s] invalid register port: %s\n", n.ID, parts[3])
 				} else {
-					// persistently add/update worker info
 					n.Workers[workerID] = WorkerInfo{ID: workerID, Host: host, Port: port}
 					n.WorkerLastSeen[workerID] = time.Now()
 					log.Printf("[%s] Applied register: %s -> %s:%d\n", n.ID, workerID, host, port)
@@ -219,8 +217,8 @@ func (n *RaftNode) applyEntries() {
 			}
 		}
 
-		// ---- Deploy command ----
-		if strings.HasPrefix(cmd, "deploy|") {
+		// ---- Deploy command (only leader executes) ----
+		if strings.HasPrefix(cmd, "deploy|") && n.role == Leader {
 			parts := strings.SplitN(cmd, "|", 6)
 			if len(parts) != 6 {
 				log.Printf("[%s] malformed deploy command: %s\n", n.ID, cmd)
@@ -231,15 +229,13 @@ func (n *RaftNode) applyEntries() {
 				workerID := parts[4]
 				portStr := parts[5]
 
-				// run deployment asynchronously
-				n.mu.Unlock()
 				go func(user, site, fileURL, workerID, portStr string) {
 					n.mu.Lock()
 					worker, ok := n.Workers[workerID]
-					isLeader := n.role == Leader
 					n.mu.Unlock()
 
-					if !ok || !isLeader {
+					if !ok {
+						log.Printf("[%s] deploy: worker %s not found\n", n.ID, workerID)
 						return
 					}
 
@@ -263,11 +259,10 @@ func (n *RaftNode) applyEntries() {
 						log.Printf("[%s] worker %s deploy failed: %s\n", n.ID, workerID, reply.Message)
 					}
 				}(user, site, fileURL, workerID, portStr)
-				n.mu.Lock()
 			}
 		}
 
-		// ---- Send to applyCh (non-blocking) ----
+		// ---- Send entry to applyCh (non-blocking) ----
 		select {
 		case n.applyCh <- entry:
 		default:

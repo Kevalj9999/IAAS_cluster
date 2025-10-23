@@ -24,7 +24,7 @@ func (n *RaftNode) startHTTPServer(port int) {
 	mux := http.NewServeMux()
 
 	// ensure uploads dir
-	uploadsDir := filepath.Join("uploads", n.ID)
+	uploadsDir := "uploads"
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		log.Printf("[%s] cannot create uploads dir: %v\n", n.ID, err)
 	}
@@ -54,23 +54,30 @@ func (n *RaftNode) startHTTPServer(port int) {
 	})
 
 	// deploy: accepts multipart/form-data with fields: user, site, file (zip)
+	// Ensure uploadsDir exists and serve files under /uploads/
+	_ = os.MkdirAll(uploadsDir, 0o755)
+
+	// deploy: accepts multipart/form-data with fields: user, site, file (zip)
 	mux.HandleFunc("/deploy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		// parse multipart
-		err := r.ParseMultipartForm(50 << 20) // 50MB max
+
+		// parse multipart form (50MB max)
+		err := r.ParseMultipartForm(50 << 20)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+
 		user := r.FormValue("user")
 		site := r.FormValue("site")
 		if user == "" || site == "" {
 			http.Error(w, "missing user or site", http.StatusBadRequest)
 			return
 		}
+
 		file, header, err := r.FormFile("file")
 		if err != nil {
 			http.Error(w, "missing file: "+err.Error(), http.StatusBadRequest)
@@ -78,11 +85,15 @@ func (n *RaftNode) startHTTPServer(port int) {
 		}
 		defer file.Close()
 
-		// save to uploads/<nodeID>/<timestamp>_<filename>
+		// Save uploaded file to uploads/<nodeID>/<timestamp>_<filename>
+		// Ensure uploads/<nodeID> exists
+		nodeDir := filepath.Join(uploadsDir, n.ID)
+		_ = os.MkdirAll(nodeDir, 0o755)
+
 		ts := time.Now().UnixNano()
 		fileName := fmt.Sprintf("%d_%s", ts, filepath.Base(header.Filename))
-		destDir := uploadsDir
-		destPath := filepath.Join(destDir, fileName)
+		destPath := filepath.Join(nodeDir, fileName)
+
 		out, err := os.Create(destPath)
 		if err != nil {
 			http.Error(w, "cannot create file: "+err.Error(), http.StatusInternalServerError)
@@ -96,28 +107,36 @@ func (n *RaftNode) startHTTPServer(port int) {
 		out.Close()
 
 		// Build accessible URL for the worker to download
-		// Use Host header if present to build absolute URL, otherwise use localhost and rest port (port+100)
 		host := r.Host
 		if host == "" {
 			host = fmt.Sprintf("localhost:%d", port+100)
 		}
-		// public URL: http://<host>/uploads/<nodeID>/<fileName>
-		fileURL := fmt.Sprintf("http://%s/uploads/%s/%s", host, n.ID, fileName)
+		destDir := filepath.Join(uploadsDir, n.ID) // ensure path matches URL
+		_ = os.MkdirAll(destDir, 0o755)
+		destPath = filepath.Join(destDir, fileName)
 
+		// Then URL:
+		fileURL := fmt.Sprintf("http://%s/uploads/%s/%s", host, n.ID, fileName)
 		log.Printf("[%s] Received site upload: user=%s site=%s file=%s url=%s\n", n.ID, user, site, destPath, fileURL)
 
-		// ask leader to deploy (this will append deploy command to Raft log)
+		// Ask leader to deploy (append deploy command to Raft log)
 		err2 := n.DeploySiteWithURL(user, site, fileURL)
 		if err2 != nil {
 			log.Printf("[%s] DeploySiteWithURL failed: %v\n", n.ID, err2)
 			http.Error(w, "deploy failed: "+err2.Error(), http.StatusBadRequest)
 			return
 		}
+
 		fmt.Fprintf(w, "Deployment requested. user=%s site=%s\n", user, site)
 	})
 
-	addr := fmt.Sprintf(":%d", port+100) // REST port offset (+100)
+	// Start REST API server on port+100
+	addr := fmt.Sprintf(":%d", port+100)
 	log.Printf("[%s] REST API listening on %s\n", n.ID, addr)
 	srv := &http.Server{Addr: addr, Handler: mux}
-	go srv.ListenAndServe()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[%s] REST server failed: %v", n.ID, err)
+		}
+	}()
 }
