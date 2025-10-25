@@ -42,13 +42,13 @@ func (n *RaftNode) DeploySiteWithURL(user, site, fileURL string) error {
 	chosen := activeWorkers[rand.Intn(len(activeWorkers))]
 	n.mu.Unlock()
 
-	// ✅ use '|' delimiter to avoid URL colon issues
+	// Use '|' delimiter to avoid URL colon issues
 	cmd := fmt.Sprintf("deploy|%s|%s|%s|%s|%d", user, site, fileURL, chosen.ID, chosen.Port)
 
 	args := SubmitCommandArgs{Command: cmd}
 	var reply SubmitCommandReply
 
-	// reuse existing command submit logic
+	// Submit locally (method call — the code checks role and handles replication)
 	rpcObj := RaftRPC{node: n}
 	if err := rpcObj.SubmitCommand(args, &reply); err != nil {
 		return fmt.Errorf("SubmitCommand RPC error: %v", err)

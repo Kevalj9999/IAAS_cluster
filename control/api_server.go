@@ -18,19 +18,18 @@ type DeployRequest struct {
 	Folder string `json:"folder"` // optional
 }
 
-// startHTTPServer runs a REST API on the control node
+// startHTTPServer runs a REST API on the node
 // It also serves uploaded zips under /uploads/
 func (n *RaftNode) startHTTPServer(port int) {
 	mux := http.NewServeMux()
 
-	// ensure uploads dir
 	uploadsDir := "uploads"
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		log.Printf("[%s] cannot create uploads dir: %v\n", n.ID, err)
 	}
 
 	// serve uploads under /uploads/<nodeID>/...
-	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
+	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir))))
 
 	// health/status
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -54,10 +53,8 @@ func (n *RaftNode) startHTTPServer(port int) {
 	})
 
 	// deploy: accepts multipart/form-data with fields: user, site, file (zip)
-	// Ensure uploadsDir exists and serve files under /uploads/
 	_ = os.MkdirAll(uploadsDir, 0o755)
 
-	// deploy: accepts multipart/form-data with fields: user, site, file (zip)
 	mux.HandleFunc("/deploy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -65,8 +62,7 @@ func (n *RaftNode) startHTTPServer(port int) {
 		}
 
 		// parse multipart form (50MB max)
-		err := r.ParseMultipartForm(50 << 20)
-		if err != nil {
+		if err := r.ParseMultipartForm(50 << 20); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -86,9 +82,11 @@ func (n *RaftNode) startHTTPServer(port int) {
 		defer file.Close()
 
 		// Save uploaded file to uploads/<nodeID>/<timestamp>_<filename>
-		// Ensure uploads/<nodeID> exists
 		nodeDir := filepath.Join(uploadsDir, n.ID)
-		_ = os.MkdirAll(nodeDir, 0o755)
+		if err := os.MkdirAll(nodeDir, 0o755); err != nil {
+			http.Error(w, "cannot create node upload dir: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 
 		ts := time.Now().UnixNano()
 		fileName := fmt.Sprintf("%d_%s", ts, filepath.Base(header.Filename))
@@ -104,26 +102,22 @@ func (n *RaftNode) startHTTPServer(port int) {
 			http.Error(w, "cannot save file: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
-		out.Close()
+		_ = out.Close()
 
-		// Build accessible URL for the worker to download
+		// Build accessible URL for the cluster to download.
+		// Use Host header if present (it includes host:port), fallback to advertised host and API port.
 		host := r.Host
 		if host == "" {
-			host = fmt.Sprintf("localhost:%d", port+100)
+			// The HTTP API listens on RPC port + 100
+			host = fmt.Sprintf("%s:%d", n.Host, port+100)
 		}
-		destDir := filepath.Join(uploadsDir, n.ID) // ensure path matches URL
-		_ = os.MkdirAll(destDir, 0o755)
-		destPath = filepath.Join(destDir, fileName)
-
-		// Then URL:
 		fileURL := fmt.Sprintf("http://%s/uploads/%s/%s", host, n.ID, fileName)
 		log.Printf("[%s] Received site upload: user=%s site=%s file=%s url=%s\n", n.ID, user, site, destPath, fileURL)
 
 		// Ask leader to deploy (append deploy command to Raft log)
-		err2 := n.DeploySiteWithURL(user, site, fileURL)
-		if err2 != nil {
-			log.Printf("[%s] DeploySiteWithURL failed: %v\n", n.ID, err2)
-			http.Error(w, "deploy failed: "+err2.Error(), http.StatusBadRequest)
+		if err := n.DeploySiteWithURL(user, site, fileURL); err != nil {
+			log.Printf("[%s] DeploySiteWithURL failed: %v\n", n.ID, err)
+			http.Error(w, "deploy failed: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 

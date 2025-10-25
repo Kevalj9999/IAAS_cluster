@@ -34,13 +34,18 @@ type VolatileState struct {
 	lastApplied int
 }
 
-// RaftNode is the primary struct for a node
+// RaftNode is the primary struct for a node (unified control + worker)
 type RaftNode struct {
 	mu sync.Mutex
 
+	// identity & network
 	ID    string
-	Port  int
-	Peers []string // peer addresses "host:port"
+	Host  string // optional human-readable host
+	Port  int    // RPC port (existing code uses this)
+	Peers []string
+
+	// where this node serves sites (local filesystem)
+	SitesDir string
 
 	// states
 	role       RaftRole
@@ -64,20 +69,21 @@ type RaftNode struct {
 	applyCh chan LogEntry
 
 	// Worker registry derived from committed log (persisted entries)
+	// In unified nodes, this maps known node IDs to their host/port (optional)
 	Workers map[string]WorkerInfo
 	// Volatile liveness info maintained by the current leader
 	WorkerLastSeen map[string]time.Time
-	// mutex already exists as n.mu
 }
 
 // WorkerInfo holds data persisted in the Raft log (ID, host, port)
+// In unified nodes this is just peer metadata.
 type WorkerInfo struct {
 	ID   string
 	Host string
 	Port int
 }
 
-// Volatile worker state (not persisted)
+// Volatile worker runtime state (not persisted)
 type WorkerState struct {
 	LeaderID     string
 	SuccessCount int

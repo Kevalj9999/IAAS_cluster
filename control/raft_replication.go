@@ -1,9 +1,14 @@
 package main
 
 import (
+	"archive/zip"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"net/rpc"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,7 +51,7 @@ func (n *RaftNode) replicateLogEntry(entry LogEntry) bool {
 			}
 			var reply AppendEntriesReply
 
-			// set timeout context manually
+			// set timeout manually
 			done := make(chan error, 1)
 			go func() { done <- client.Call("RaftRPC.AppendEntries", args, &reply) }()
 			select {
@@ -79,7 +84,6 @@ func (n *RaftNode) replicateLogEntry(entry LogEntry) bool {
 }
 
 // replicateLogEntries broadcasts the given entries to all followers.
-// Returns true if the entry(ies) reach majority and leader advances commitIndex.
 func (n *RaftNode) replicateLogEntries(entries []LogEntry) bool {
 	n.mu.Lock()
 	if n.role != Leader {
@@ -153,7 +157,7 @@ func (n *RaftNode) replicateLogEntries(entries []LogEntry) bool {
 		}(peer)
 	}
 
-	// wait for majority (max 500ms)
+	// wait for majority (max ~500ms)
 	waited := 0
 	for waited < 500 {
 		if int(atomic.LoadInt32(&successCount)) >= required {
@@ -171,6 +175,70 @@ func (n *RaftNode) replicateLogEntries(entries []LogEntry) bool {
 		waited += 25
 	}
 	return false
+}
+
+// =======================
+// Helpers: download & unzip
+// =======================
+
+func downloadToTemp(url string) (string, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	tmpFile, err := os.CreateTemp("", "site_*.zip")
+	if err != nil {
+		return "", err
+	}
+	defer tmpFile.Close()
+
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", err
+	}
+	return tmpFile.Name(), nil
+}
+
+func unzip(src, destDir string) error {
+	r, err := zip.OpenReader(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		fpath := filepath.Join(destDir, f.Name)
+		// Prevent ZipSlip vulnerability
+		if !strings.HasPrefix(fpath, filepath.Clean(destDir)+string(os.PathSeparator)) {
+			return fmt.Errorf("invalid file path: %s", fpath)
+		}
+		if f.FileInfo().IsDir() {
+			_ = os.MkdirAll(fpath, os.ModePerm)
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+			return err
+		}
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyEntries moves entries from lastApplied+1 .. commitIndex to applyCh (state machine)
@@ -198,7 +266,7 @@ func (n *RaftNode) applyEntries() {
 
 		cmd := entry.Command
 
-		// ---- Worker registration (applied on ALL nodes) ----
+		// ---- Worker/peer registration (applied on ALL nodes) ----
 		if strings.HasPrefix(cmd, "register|") {
 			parts := strings.SplitN(cmd, "|", 4)
 			if len(parts) != 4 {
@@ -217,8 +285,8 @@ func (n *RaftNode) applyEntries() {
 			}
 		}
 
-		// ---- Deploy command (only leader executes) ----
-		if strings.HasPrefix(cmd, "deploy|") && n.role == Leader {
+		// ---- Deploy command: each node downloads & extracts locally ----
+		if strings.HasPrefix(cmd, "deploy|") {
 			parts := strings.SplitN(cmd, "|", 6)
 			if len(parts) != 6 {
 				log.Printf("[%s] malformed deploy command: %s\n", n.ID, cmd)
@@ -226,39 +294,32 @@ func (n *RaftNode) applyEntries() {
 				user := parts[1]
 				site := parts[2]
 				fileURL := parts[3]
-				workerID := parts[4]
-				portStr := parts[5]
+				// workerID and port are preserved in the command for compatibility/choice,
+				// but in unified mode each node will download the site locally.
+				// workerID := parts[4]
+				// portStr := parts[5]
 
-				go func(user, site, fileURL, workerID, portStr string) {
-					n.mu.Lock()
-					worker, ok := n.Workers[workerID]
-					n.mu.Unlock()
-
-					if !ok {
-						log.Printf("[%s] deploy: worker %s not found\n", n.ID, workerID)
+				// run download & unzip in background (non-blocking)
+				go func(user, site, fileURL string) {
+					targetDir := filepath.Join(n.SitesDir, user, site)
+					if err := os.MkdirAll(targetDir, 0o755); err != nil {
+						log.Printf("[%s] deploy: mkdir failed: %v\n", n.ID, err)
 						return
 					}
-
-					addr := fmt.Sprintf("%s:%d", worker.Host, worker.Port+1000)
-					client, err := rpc.Dial("tcp", addr)
+					log.Printf("[%s] Deploy: downloading %s for %s/%s -> %s\n", n.ID, fileURL, user, site, targetDir)
+					tmpZip, err := downloadToTemp(fileURL)
 					if err != nil {
-						log.Printf("[%s] deploy: cannot dial worker %s at %s: %v\n", n.ID, workerID, addr, err)
+						log.Printf("[%s] deploy: download failed: %v\n", n.ID, err)
 						return
 					}
-					defer client.Close()
+					defer os.Remove(tmpZip)
 
-					args := AssignDeploymentArgs{User: user, Site: site, FileURL: fileURL}
-					var reply AssignDeploymentReply
-					if err := client.Call("WorkerRPC.AssignDeployment", args, &reply); err != nil {
-						log.Printf("[%s] deploy RPC error to worker %s: %v\n", n.ID, workerID, err)
+					if err := unzip(tmpZip, targetDir); err != nil {
+						log.Printf("[%s] deploy: unzip failed: %v\n", n.ID, err)
 						return
 					}
-					if reply.Success {
-						log.Printf("[%s] worker %s deployed %s/%s successfully\n", n.ID, workerID, user, site)
-					} else {
-						log.Printf("[%s] worker %s deploy failed: %s\n", n.ID, workerID, reply.Message)
-					}
-				}(user, site, fileURL, workerID, portStr)
+					log.Printf("[%s] deploy: site available at %s (user=%s site=%s)\n", n.ID, targetDir, user, site)
+				}(user, site, fileURL)
 			}
 		}
 

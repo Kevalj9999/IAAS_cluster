@@ -7,26 +7,27 @@ import (
 	"net/rpc"
 )
 
+// startRPCServer launches the RPC listener for this node.
 func (n *RaftNode) startRPCServer() {
-	rpcService := &RaftRPC{node: n}
-	err := rpc.RegisterName("RaftRPC", rpcService)
-	if err != nil {
-		log.Fatalf("rpc register failed: %v", err)
+	service := &RaftRPC{node: n}
+	if err := rpc.RegisterName("RaftRPC", service); err != nil {
+		log.Fatalf("[%s] RPC register failed: %v", n.ID, err)
 	}
 	addr := fmt.Sprintf(":%d", n.Port)
-	l, err := net.Listen("tcp", addr)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Fatalf("listen failed: %v", err)
+		log.Fatalf("[%s] RPC listen failed: %v", n.ID, err)
 	}
-	log.Printf("[%s] RPC server listening on %s\n", n.ID, addr)
+	log.Printf("[%s] RPC listening on %s\n", n.ID, addr)
+
 	for {
-		conn, err := l.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			select {
 			case <-n.stopCh:
 				return
 			default:
-				log.Printf("accept error: %v", err)
+				log.Printf("[%s] accept error: %v", n.ID, err)
 				continue
 			}
 		}

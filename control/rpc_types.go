@@ -1,10 +1,9 @@
 package main
 
-// RequestVoteArgs and Reply for RAFT voting RPC
+// ==== Raft Core RPC Types ====
 type RequestVoteArgs struct {
 	Term        int
 	CandidateID string
-	// LastLogIndex/Term omitted for simplicity
 }
 
 type RequestVoteReply struct {
@@ -12,7 +11,6 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// AppendEntriesArgs and Reply for RAFT heartbeat/log replication
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderID     string
@@ -25,17 +23,45 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term       int
 	Success    bool
-	MatchIndex int // index of last matched entry on follower when success
+	MatchIndex int
 }
 
-// AssignDeploymentArgs defines what leader sends to a worker to deploy a site.
+// ==== Cluster API RPCs ====
+type SubmitCommandArgs struct {
+	Command string
+}
+
+type SubmitCommandReply struct {
+	Success  bool
+	LeaderID string
+	Message  string
+}
+
+// ==== Worker heartbeat and list ====
+type WorkerHeartbeatArgs struct {
+	WorkerID string
+	Host     string
+	Port     int
+}
+
+type WorkerHeartbeatReply struct {
+	Success  bool
+	LeaderID string
+	Message  string
+}
+
+type ListWorkersReply struct {
+	Workers []WorkerInfo
+	Leader  string
+}
+
+// ==== Deployment RPCs (when leader asks a node to host a site) ====
 type AssignDeploymentArgs struct {
 	User    string
 	Site    string
-	FileURL string // <-- this is the new field (URL to zip)
+	FileURL string
 }
 
-// AssignDeploymentReply is returned by the worker after trying to deploy.
 type AssignDeploymentReply struct {
 	Success bool
 	Message string

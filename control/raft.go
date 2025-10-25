@@ -16,7 +16,7 @@ type RaftRPC struct {
 	node *RaftNode
 }
 
-// ----------- (3b) RequestVote with persistence -----------
+// ----------- RequestVote with persistence -----------
 func (r *RaftRPC) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	n := r.node
 	n.mu.Lock()
@@ -43,23 +43,29 @@ func (r *RaftRPC) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) err
 		n.persistent.VotedFor = args.CandidateID
 		reply.VoteGranted = true
 
-		// ✅ (3b) persist after granting vote
+		// persist after granting vote
 		if err := n.persistState(); err != nil {
 			log.Printf("[%s] persist after vote error: %v\n", n.ID, err)
 		}
 
-		go func() { n.grantVoteCh <- true }()
+		// notify election timer reset
+		select {
+		case n.grantVoteCh <- true:
+		default:
+		}
 	}
 
 	reply.Term = n.persistent.CurrentTerm
 	return nil
 }
 
-func NewRaftNode(id string, port int, peers []string) *RaftNode {
+func NewRaftNode(id, host string, port int, peers []string, sitesDir string) *RaftNode {
 	n := &RaftNode{
 		ID:             id,
+		Host:           host,
 		Port:           port,
 		Peers:          peers,
+		SitesDir:       sitesDir,
 		role:           Follower,
 		persistent:     PersistentState{CurrentTerm: 0, VotedFor: "", Log: []LogEntry{}},
 		grantVoteCh:    make(chan bool, 1),
@@ -68,8 +74,6 @@ func NewRaftNode(id string, port int, peers []string) *RaftNode {
 		stopCh:         make(chan struct{}),
 		applyCh:        make(chan LogEntry, 100),
 		StateFile:      stateFilename(id),
-
-		// ✅ initialize maps
 		Workers:        make(map[string]WorkerInfo),
 		WorkerLastSeen: make(map[string]time.Time),
 		matchIndex:     make(map[string]int),
@@ -86,6 +90,7 @@ func NewRaftNode(id string, port int, peers []string) *RaftNode {
 }
 
 func (n *RaftNode) Start() {
+	// start RPC server and election loop
 	go n.startRPCServer()
 	go n.electionLoop()
 	go n.roleLoop()
@@ -94,16 +99,16 @@ func (n *RaftNode) Start() {
 func (n *RaftNode) Stop() { close(n.stopCh) }
 
 // =============================================================
-// Election Logic (3a persistence included)
+// Election Logic and timers
 // =============================================================
 
 func (n *RaftNode) resetElectionTimer() {
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
 	}
-	// Randomized timeout per node
-	const MinElectionTimeout = 1500 * time.Millisecond
-	const MaxElectionTimeout = 3000 * time.Millisecond
+	// Randomized timeout per node - longer timeouts for stability
+	const MinElectionTimeout = 2000 * time.Millisecond
+	const MaxElectionTimeout = 3500 * time.Millisecond
 	timeout := MinElectionTimeout + time.Duration(rand.Int63n(int64(MaxElectionTimeout-MinElectionTimeout)))
 	n.electionTimer = time.NewTimer(timeout)
 }
@@ -137,7 +142,10 @@ func (n *RaftNode) startElection() {
 	n.persistent.CurrentTerm++
 	n.persistent.VotedFor = n.ID
 	term := n.persistent.CurrentTerm
-	n.persistState()
+	// persist changes
+	if err := n.persistState(); err != nil {
+		log.Printf("[%s] persist error starting election: %v\n", n.ID, err)
+	}
 	n.mu.Unlock()
 
 	log.Printf("[%s] Starting election for term %d\n", n.ID, term)
@@ -162,7 +170,9 @@ func (n *RaftNode) startElection() {
 				n.persistent.CurrentTerm = reply.Term
 				n.role = Follower
 				n.persistent.VotedFor = ""
-				n.persistState()
+				if err := n.persistState(); err != nil {
+					log.Printf("[%s] persist after term update error: %v\n", n.ID, err)
+				}
 				n.mu.Unlock()
 				return
 			}
@@ -174,7 +184,8 @@ func (n *RaftNode) startElection() {
 		}(peer)
 	}
 
-	time.Sleep(350 * time.Millisecond)
+	// wait a short fixed time for votes
+	time.Sleep(400 * time.Millisecond)
 
 	nTotal := 1 + len(n.Peers)
 	if int(atomic.LoadInt32(&votes))*2 > nTotal {
@@ -193,7 +204,11 @@ func (n *RaftNode) startElection() {
 
 		log.Printf("[%s] Became leader for term %d (votes=%d/%d)\n",
 			n.ID, term, votes, nTotal)
-		n.leaderChangeCh <- Leader
+		// notify leader change
+		select {
+		case n.leaderChangeCh <- Leader:
+		default:
+		}
 	} else {
 		n.mu.Lock()
 		n.role = Follower
@@ -208,7 +223,7 @@ func (n *RaftNode) roleLoop() {
 			return
 		case role := <-n.leaderChangeCh:
 			if role == Leader {
-				// Rebuild worker state from committed log without touching heartbeat/election channels
+				// reconstruct worker registry from committed log (no locking of channels here)
 				go func() {
 					n.mu.Lock()
 					defer n.mu.Unlock()
@@ -270,7 +285,7 @@ func (n *RaftNode) leaderHeartbeater() {
 						n.persistent.CurrentTerm = reply.Term
 						n.role = Follower
 						n.persistent.VotedFor = ""
-						n.persistState()
+						_ = n.persistState()
 						n.mu.Unlock()
 					}
 				}(peer)
