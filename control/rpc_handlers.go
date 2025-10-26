@@ -181,3 +181,12 @@ func (r *RaftRPC) ListWorkers(_ struct{}, reply *ListWorkersReply) error {
 	}
 	return nil
 }
+
+// IsLeader RPC: quick probe to ask "are you leader?"
+func (r *RaftRPC) IsLeader(_ struct{}, reply *bool) error {
+	n := r.node
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	*reply = (n.role == Leader)
+	return nil
+}

@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -202,7 +201,7 @@ func downloadToTemp(url string) (string, error) {
 	return tmpFile.Name(), nil
 }
 
-func unzip(src, destDir string) error {
+func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
@@ -210,30 +209,39 @@ func unzip(src, destDir string) error {
 	defer r.Close()
 
 	for _, f := range r.File {
-		fpath := filepath.Join(destDir, f.Name)
-		// Prevent ZipSlip vulnerability
-		if !strings.HasPrefix(fpath, filepath.Clean(destDir)+string(os.PathSeparator)) {
-			return fmt.Errorf("invalid file path: %s", fpath)
+		fpath := filepath.Join(dest, f.Name)
+
+		// flatten if nested top-level dir (e.g., "sample_site/")
+		if parts := strings.SplitN(f.Name, string(os.PathSeparator), 2); len(parts) == 2 {
+			// remove first folder from path
+			fpath = filepath.Join(dest, parts[1])
 		}
+
 		if f.FileInfo().IsDir() {
-			_ = os.MkdirAll(fpath, os.ModePerm)
+			os.MkdirAll(fpath, 0755)
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(fpath), os.ModePerm); err != nil {
+
+		if err := os.MkdirAll(filepath.Dir(fpath), 0755); err != nil {
 			return err
 		}
+
 		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
 		if err != nil {
 			return err
 		}
+
 		rc, err := f.Open()
 		if err != nil {
 			outFile.Close()
 			return err
 		}
+
 		_, err = io.Copy(outFile, rc)
+
 		outFile.Close()
 		rc.Close()
+
 		if err != nil {
 			return err
 		}
@@ -260,32 +268,27 @@ func (n *RaftNode) applyEntries() {
 			}
 		}
 		if !found {
-			log.Printf("[%s] applyEntries: entry index %d not found in log (commitIndex=%d)\n", n.ID, idx, n.volatile.commitIndex)
+			log.Printf("[%s] applyEntries: entry index %d not found in log (commitIndex=%d)\n",
+				n.ID, idx, n.volatile.commitIndex)
 			continue
 		}
 
 		cmd := entry.Command
 
-		// ---- Worker/peer registration (applied on ALL nodes) ----
+		// ---- Worker/peer registration ----
 		if strings.HasPrefix(cmd, "register|") {
 			parts := strings.SplitN(cmd, "|", 4)
-			if len(parts) != 4 {
-				log.Printf("[%s] malformed register command: %s\n", n.ID, cmd)
-			} else {
+			if len(parts) == 4 {
 				workerID := parts[1]
 				host := parts[2]
-				port, err := strconv.Atoi(parts[3])
-				if err != nil {
-					log.Printf("[%s] invalid register port: %s\n", n.ID, parts[3])
-				} else {
-					n.Workers[workerID] = WorkerInfo{ID: workerID, Host: host, Port: port}
-					n.WorkerLastSeen[workerID] = time.Now()
-					log.Printf("[%s] Applied register: %s -> %s:%d\n", n.ID, workerID, host, port)
-				}
+				port, _ := strconv.Atoi(parts[3])
+				n.Workers[workerID] = WorkerInfo{ID: workerID, Host: host, Port: port}
+				n.WorkerLastSeen[workerID] = time.Now()
+				log.Printf("[%s] Applied register: %s -> %s:%d\n", n.ID, workerID, host, port)
 			}
 		}
 
-		// ---- Deploy command: each node downloads & extracts locally ----
+		// ---- Deploy command ----
 		if strings.HasPrefix(cmd, "deploy|") {
 			parts := strings.SplitN(cmd, "|", 6)
 			if len(parts) != 6 {
@@ -294,19 +297,17 @@ func (n *RaftNode) applyEntries() {
 				user := parts[1]
 				site := parts[2]
 				fileURL := parts[3]
-				// workerID and port are preserved in the command for compatibility/choice,
-				// but in unified mode each node will download the site locally.
-				// workerID := parts[4]
-				// portStr := parts[5]
 
-				// run download & unzip in background (non-blocking)
 				go func(user, site, fileURL string) {
 					targetDir := filepath.Join(n.SitesDir, user, site)
 					if err := os.MkdirAll(targetDir, 0o755); err != nil {
 						log.Printf("[%s] deploy: mkdir failed: %v\n", n.ID, err)
 						return
 					}
-					log.Printf("[%s] Deploy: downloading %s for %s/%s -> %s\n", n.ID, fileURL, user, site, targetDir)
+
+					log.Printf("[%s] Deploy: downloading %s for %s/%s -> %s\n",
+						n.ID, fileURL, user, site, targetDir)
+
 					tmpZip, err := downloadToTemp(fileURL)
 					if err != nil {
 						log.Printf("[%s] deploy: download failed: %v\n", n.ID, err)
@@ -314,11 +315,41 @@ func (n *RaftNode) applyEntries() {
 					}
 					defer os.Remove(tmpZip)
 
-					if err := unzip(tmpZip, targetDir); err != nil {
+					// ✅ Extract to a temporary folder first
+					tmpExtract := targetDir + "_tmp"
+					os.RemoveAll(tmpExtract)
+					if err := os.MkdirAll(tmpExtract, 0o755); err != nil {
+						log.Printf("[%s] deploy: mkdir tmp failed: %v\n", n.ID, err)
+						return
+					}
+
+					if err := unzip(tmpZip, tmpExtract); err != nil {
 						log.Printf("[%s] deploy: unzip failed: %v\n", n.ID, err)
 						return
 					}
-					log.Printf("[%s] deploy: site available at %s (user=%s site=%s)\n", n.ID, targetDir, user, site)
+
+					// ✅ Flatten if there's a single subdirectory (like "sample_site")
+					entries, _ := os.ReadDir(tmpExtract)
+					if len(entries) == 1 && entries[0].IsDir() {
+						inner := filepath.Join(tmpExtract, entries[0].Name())
+						files, _ := os.ReadDir(inner)
+						for _, f := range files {
+							src := filepath.Join(inner, f.Name())
+							dst := filepath.Join(targetDir, f.Name())
+							os.Rename(src, dst)
+						}
+					} else {
+						// multiple files: move everything
+						for _, f := range entries {
+							src := filepath.Join(tmpExtract, f.Name())
+							dst := filepath.Join(targetDir, f.Name())
+							os.Rename(src, dst)
+						}
+					}
+
+					os.RemoveAll(tmpExtract)
+					log.Printf("[%s] deploy: site available at %s (user=%s site=%s)\n",
+						n.ID, targetDir, user, site)
 				}(user, site, fileURL)
 			}
 		}

@@ -39,10 +39,11 @@ type RaftNode struct {
 	mu sync.Mutex
 
 	// identity & network
-	ID    string
-	Host  string // optional human-readable host
-	Port  int    // RPC port (existing code uses this)
-	Peers []string
+	ID        string
+	Host      string // optional human-readable host
+	Port      int    // RPC port (existing code uses this)
+	Peers     []string
+	PeerIDMap map[string]string // e.g. {"node1": "localhost:8001", "node2": "localhost:8002"}
 
 	// where this node serves sites (local filesystem)
 	SitesDir string

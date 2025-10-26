@@ -18,20 +18,28 @@ type DeployRequest struct {
 	Folder string `json:"folder"` // optional
 }
 
-// startHTTPServer runs a REST API on the node
-// It also serves uploaded zips under /uploads/
+// startHTTPServer runs a REST API on the node.
+// It serves both /uploads/ (shared) and /sites/ (deployed websites).
 func (n *RaftNode) startHTTPServer(port int) {
 	mux := http.NewServeMux()
 
-	uploadsDir := "uploads"
+	// ✅ Common shared uploads directory for all nodes
+	uploadsDir := "./shared_uploads"
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		log.Printf("[%s] cannot create uploads dir: %v\n", n.ID, err)
 	}
 
-	// serve uploads under /uploads/<nodeID>/...
+	// ✅ Serve shared uploads
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir))))
 
-	// health/status
+	// ✅ Serve deployed sites from this node’s sites directory
+	sitesRoot := n.SitesDir
+	if err := os.MkdirAll(sitesRoot, 0o755); err != nil {
+		log.Printf("[%s] cannot create sites dir: %v\n", n.ID, err)
+	}
+	mux.Handle("/sites/", http.StripPrefix("/sites/", http.FileServer(http.Dir(sitesRoot))))
+
+	// Health/status endpoint
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		n.mu.Lock()
 		resp := struct {
@@ -52,9 +60,7 @@ func (n *RaftNode) startHTTPServer(port int) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// deploy: accepts multipart/form-data with fields: user, site, file (zip)
-	_ = os.MkdirAll(uploadsDir, 0o755)
-
+	// ✅ Deploy endpoint
 	mux.HandleFunc("/deploy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -81,16 +87,10 @@ func (n *RaftNode) startHTTPServer(port int) {
 		}
 		defer file.Close()
 
-		// Save uploaded file to uploads/<nodeID>/<timestamp>_<filename>
-		nodeDir := filepath.Join(uploadsDir, n.ID)
-		if err := os.MkdirAll(nodeDir, 0o755); err != nil {
-			http.Error(w, "cannot create node upload dir: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-
+		// Save uploaded file to shared_uploads
 		ts := time.Now().UnixNano()
 		fileName := fmt.Sprintf("%d_%s", ts, filepath.Base(header.Filename))
-		destPath := filepath.Join(nodeDir, fileName)
+		destPath := filepath.Join(uploadsDir, fileName)
 
 		out, err := os.Create(destPath)
 		if err != nil {
@@ -104,17 +104,16 @@ func (n *RaftNode) startHTTPServer(port int) {
 		}
 		_ = out.Close()
 
-		// Build accessible URL for the cluster to download.
-		// Use Host header if present (it includes host:port), fallback to advertised host and API port.
+		// Construct shared URL (served by any node)
 		host := r.Host
 		if host == "" {
-			// The HTTP API listens on RPC port + 100
 			host = fmt.Sprintf("%s:%d", n.Host, port+100)
 		}
-		fileURL := fmt.Sprintf("http://%s/uploads/%s/%s", host, n.ID, fileName)
-		log.Printf("[%s] Received site upload: user=%s site=%s file=%s url=%s\n", n.ID, user, site, destPath, fileURL)
+		fileURL := fmt.Sprintf("http://%s/uploads/%s", host, fileName)
 
-		// Ask leader to deploy (append deploy command to Raft log)
+		log.Printf("[%s] Received site upload: user=%s site=%s file=%s url=%s\n",
+			n.ID, user, site, destPath, fileURL)
+
 		if err := n.DeploySiteWithURL(user, site, fileURL); err != nil {
 			log.Printf("[%s] DeploySiteWithURL failed: %v\n", n.ID, err)
 			http.Error(w, "deploy failed: "+err.Error(), http.StatusBadRequest)
@@ -124,10 +123,11 @@ func (n *RaftNode) startHTTPServer(port int) {
 		fmt.Fprintf(w, "Deployment requested. user=%s site=%s\n", user, site)
 	})
 
-	// Start REST API server on port+100
+	// ✅ Start REST API server
 	addr := fmt.Sprintf(":%d", port+100)
 	log.Printf("[%s] REST API listening on %s\n", n.ID, addr)
 	srv := &http.Server{Addr: addr, Handler: mux}
+
 	go func() {
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("[%s] REST server failed: %v", n.ID, err)
