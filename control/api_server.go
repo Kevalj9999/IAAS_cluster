@@ -23,8 +23,7 @@ type DeployRequest struct {
 func (n *RaftNode) startHTTPServer(port int) {
 	mux := http.NewServeMux()
 
-	// ✅ Common shared uploads directory for all nodes
-	uploadsDir := "./shared_uploads"
+	uploadsDir := "uploads"
 	if err := os.MkdirAll(uploadsDir, 0o755); err != nil {
 		log.Printf("[%s] cannot create uploads dir: %v\n", n.ID, err)
 	}
