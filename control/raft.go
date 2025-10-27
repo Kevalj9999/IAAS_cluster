@@ -244,6 +244,16 @@ func (n *RaftNode) roleLoop() {
 				}()
 
 				go n.leaderHeartbeater()
+				go func() {
+					time.Sleep(1 * time.Second)
+					n.mu.Lock()
+					if _, ok := n.Workers[n.ID]; !ok {
+						n.Workers[n.ID] = WorkerInfo{ID: n.ID, Host: n.Host, Port: n.Port}
+						n.WorkerLastSeen[n.ID] = time.Now()
+						log.Printf("[%s] self-registered as leader worker", n.ID)
+					}
+					n.mu.Unlock()
+				}()
 			}
 		}
 	}

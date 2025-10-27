@@ -11,15 +11,12 @@ import (
 	"time"
 )
 
-// DeployRequest : JSON fallback (not used when uploading multipart)
 type DeployRequest struct {
 	User   string `json:"user"`
 	Site   string `json:"site"`
-	Folder string `json:"folder"` // optional
+	Folder string `json:"folder"`
 }
 
-// startHTTPServer runs a REST API on the node.
-// It serves both /uploads/ (shared) and /sites/ (deployed websites).
 func (n *RaftNode) startHTTPServer(port int) {
 	mux := http.NewServeMux()
 
@@ -28,17 +25,14 @@ func (n *RaftNode) startHTTPServer(port int) {
 		log.Printf("[%s] cannot create uploads dir: %v\n", n.ID, err)
 	}
 
-	// ✅ Serve shared uploads
 	mux.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir))))
 
-	// ✅ Serve deployed sites from this node’s sites directory
 	sitesRoot := n.SitesDir
 	if err := os.MkdirAll(sitesRoot, 0o755); err != nil {
 		log.Printf("[%s] cannot create sites dir: %v\n", n.ID, err)
 	}
 	mux.Handle("/sites/", http.StripPrefix("/sites/", http.FileServer(http.Dir(sitesRoot))))
 
-	// Health/status endpoint
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		n.mu.Lock()
 		resp := struct {
@@ -59,14 +53,12 @@ func (n *RaftNode) startHTTPServer(port int) {
 		_ = json.NewEncoder(w).Encode(resp)
 	})
 
-	// ✅ Deploy endpoint
 	mux.HandleFunc("/deploy", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
-		// parse multipart form (50MB max)
 		if err := r.ParseMultipartForm(50 << 20); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -86,7 +78,6 @@ func (n *RaftNode) startHTTPServer(port int) {
 		}
 		defer file.Close()
 
-		// Save uploaded file to shared_uploads
 		ts := time.Now().UnixNano()
 		fileName := fmt.Sprintf("%d_%s", ts, filepath.Base(header.Filename))
 		destPath := filepath.Join(uploadsDir, fileName)
@@ -103,13 +94,7 @@ func (n *RaftNode) startHTTPServer(port int) {
 		}
 		_ = out.Close()
 
-		// Construct shared URL (served by any node)
-		host := r.Host
-		if host == "" {
-			host = fmt.Sprintf("%s:%d", n.Host, port+100)
-		}
-		fileURL := fmt.Sprintf("http://%s/uploads/%s", host, fileName)
-
+		fileURL := fmt.Sprintf("http://%s:%d/uploads/%s", n.Host, port+100, fileName)
 		log.Printf("[%s] Received site upload: user=%s site=%s file=%s url=%s\n",
 			n.ID, user, site, destPath, fileURL)
 
@@ -122,7 +107,6 @@ func (n *RaftNode) startHTTPServer(port int) {
 		fmt.Fprintf(w, "Deployment requested. user=%s site=%s\n", user, site)
 	})
 
-	// ✅ Start REST API server
 	addr := fmt.Sprintf(":%d", port+100)
 	log.Printf("[%s] REST API listening on %s\n", n.ID, addr)
 	srv := &http.Server{Addr: addr, Handler: mux}
