@@ -1,6 +1,6 @@
 package main
 
-// ==== Raft Core RPC Types ====
+// Raft Core RPC Types
 type RequestVoteArgs struct {
 	Term        int
 	CandidateID string
@@ -26,7 +26,7 @@ type AppendEntriesReply struct {
 	MatchIndex int
 }
 
-// ==== Cluster API RPCs ====
+// Cluster API RPCs
 type SubmitCommandArgs struct {
 	Command string
 }
@@ -37,7 +37,7 @@ type SubmitCommandReply struct {
 	Message  string
 }
 
-// ==== Worker heartbeat and list ====
+// Worker heartbeat
 type WorkerHeartbeatArgs struct {
 	WorkerID string
 	Host     string
@@ -53,16 +53,4 @@ type WorkerHeartbeatReply struct {
 type ListWorkersReply struct {
 	Workers []WorkerInfo
 	Leader  string
-}
-
-// ==== Deployment RPCs (when leader asks a node to host a site) ====
-type AssignDeploymentArgs struct {
-	User    string
-	Site    string
-	FileURL string
-}
-
-type AssignDeploymentReply struct {
-	Success bool
-	Message string
 }

@@ -10,13 +10,12 @@ import (
 	"time"
 )
 
-// ============ RPC Service Definition ============
-
+// RPC Service Definition
 type RaftRPC struct {
 	node *RaftNode
 }
 
-// ----------- RequestVote with persistence -----------
+// RequestVote with persistence
 func (r *RaftRPC) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	n := r.node
 	n.mu.Lock()
@@ -98,10 +97,7 @@ func (n *RaftNode) Start() {
 
 func (n *RaftNode) Stop() { close(n.stopCh) }
 
-// =============================================================
 // Election Logic and timers
-// =============================================================
-
 func (n *RaftNode) resetElectionTimer() {
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()

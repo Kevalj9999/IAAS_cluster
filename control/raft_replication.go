@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"io"
 	"log"
-	"net/http"
 	"net/rpc"
 	"os"
 	"path/filepath"
@@ -176,31 +175,6 @@ func (n *RaftNode) replicateLogEntries(entries []LogEntry) bool {
 	return false
 }
 
-// =======================
-// Helpers: download & unzip
-// =======================
-
-func downloadToTemp(url string) (string, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	tmpFile, err := os.CreateTemp("", "site_*.zip")
-	if err != nil {
-		return "", err
-	}
-	defer tmpFile.Close()
-
-	_, err = io.Copy(tmpFile, resp.Body)
-	if err != nil {
-		os.Remove(tmpFile.Name())
-		return "", err
-	}
-	return tmpFile.Name(), nil
-}
-
 func unzip(src, dest string) error {
 	r, err := zip.OpenReader(src)
 	if err != nil {
@@ -275,7 +249,7 @@ func (n *RaftNode) applyEntries() {
 
 		cmd := entry.Command
 
-		// ---- Worker/peer registration ----
+		// Worker/peer registration
 		if strings.HasPrefix(cmd, "register|") {
 			parts := strings.SplitN(cmd, "|", 4)
 			if len(parts) == 4 {
@@ -288,7 +262,7 @@ func (n *RaftNode) applyEntries() {
 			}
 		}
 
-		// ---- Deploy command ----
+		// Deploy command
 		if strings.HasPrefix(cmd, "deploy|") {
 			parts := strings.SplitN(cmd, "|", 6)
 			if len(parts) != 6 {
@@ -340,7 +314,7 @@ func (n *RaftNode) applyEntries() {
 			}
 		}
 
-		// ---- Send entry to applyCh (non-blocking) ----
+		//  Send entry to applyCh (non-blocking)
 		select {
 		case n.applyCh <- entry:
 		default:

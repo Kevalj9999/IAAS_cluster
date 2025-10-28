@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// ====== AppendEntries (Heartbeat / Replication) ======
+// AppendEntries (Heartbeat / Replication)
 func (r *RaftRPC) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	n := r.node
 	n.mu.Lock()
@@ -86,7 +86,7 @@ func (r *RaftRPC) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesRepl
 	return nil
 }
 
-// ====== SubmitCommand (Client / Internal Command Append) ======
+// SubmitCommand (Client / Internal Command Append)
 func (r *RaftRPC) SubmitCommand(args SubmitCommandArgs, reply *SubmitCommandReply) error {
 	n := r.node
 
@@ -128,7 +128,7 @@ func (r *RaftRPC) SubmitCommand(args SubmitCommandArgs, reply *SubmitCommandRepl
 	return nil
 }
 
-// ====== Worker / Node Heartbeat ======
+// Worker / Node Heartbeat
 var workerStates = make(map[string]*WorkerState)
 
 func (r *RaftRPC) WorkerHeartbeat(args WorkerHeartbeatArgs, reply *WorkerHeartbeatReply) error {
@@ -169,7 +169,6 @@ func (r *RaftRPC) WorkerHeartbeat(args WorkerHeartbeatArgs, reply *WorkerHeartbe
 	return nil
 }
 
-// ====== ListWorkers ======
 func (r *RaftRPC) ListWorkers(_ struct{}, reply *ListWorkersReply) error {
 	n := r.node
 	n.mu.Lock()
