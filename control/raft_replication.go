@@ -297,60 +297,46 @@ func (n *RaftNode) applyEntries() {
 				user := parts[1]
 				site := parts[2]
 				fileURL := parts[3]
+				fileName := filepath.Base(fileURL)
+				sharedZip := filepath.Join("uploads", fileName)
+				targetDir := filepath.Join(n.SitesDir, user, site)
 
-				go func(user, site, fileURL string) {
-					targetDir := filepath.Join(n.SitesDir, user, site)
+				go func() {
+					log.Printf("[%s] deploy: extracting %s -> %s", n.ID, sharedZip, targetDir)
 					if err := os.MkdirAll(targetDir, 0o755); err != nil {
-						log.Printf("[%s] deploy: mkdir failed: %v\n", n.ID, err)
+						log.Printf("[%s] deploy mkdir failed: %v", n.ID, err)
+						return
+					}
+					if err := unzip(sharedZip, targetDir); err != nil {
+						log.Printf("[%s] deploy unzip failed: %v", n.ID, err)
+						return
+					}
+					log.Printf("[%s] deploy: site ready at %s", n.ID, targetDir)
+
+					// === replicate folder to peers if we are leader ===
+					n.mu.Lock()
+					isLeader := (n.role == Leader)
+					peers := append([]string{}, n.Peers...)
+					n.mu.Unlock()
+					if !isLeader {
 						return
 					}
 
-					log.Printf("[%s] Deploy: downloading %s for %s/%s -> %s\n",
-						n.ID, fileURL, user, site, targetDir)
+					for _, peer := range peers {
+						peerPortPart := strings.Split(peer, ":")[1]
+						sitesDir := "./sites_node" + peerPortPart[len(peerPortPart)-1:] // crude: 8001→1
+						peerTarget := filepath.Join(sitesDir, user, site)
 
-					tmpZip, err := downloadToTemp(fileURL)
-					if err != nil {
-						log.Printf("[%s] deploy: download failed: %v\n", n.ID, err)
-						return
+						go func(peerTarget string) {
+							if err := os.MkdirAll(peerTarget, 0o755); err != nil {
+								log.Printf("[%s] replicate mkdir %s failed: %v", n.ID, peerTarget, err)
+								return
+							}
+							copyDir(targetDir, peerTarget)
+							log.Printf("[%s] replicated site to %s", n.ID, peerTarget)
+						}(peerTarget)
 					}
-					defer os.Remove(tmpZip)
-
-					// ✅ Extract to a temporary folder first
-					tmpExtract := targetDir + "_tmp"
-					os.RemoveAll(tmpExtract)
-					if err := os.MkdirAll(tmpExtract, 0o755); err != nil {
-						log.Printf("[%s] deploy: mkdir tmp failed: %v\n", n.ID, err)
-						return
-					}
-
-					if err := unzip(tmpZip, tmpExtract); err != nil {
-						log.Printf("[%s] deploy: unzip failed: %v\n", n.ID, err)
-						return
-					}
-
-					// ✅ Flatten if there's a single subdirectory (like "sample_site")
-					entries, _ := os.ReadDir(tmpExtract)
-					if len(entries) == 1 && entries[0].IsDir() {
-						inner := filepath.Join(tmpExtract, entries[0].Name())
-						files, _ := os.ReadDir(inner)
-						for _, f := range files {
-							src := filepath.Join(inner, f.Name())
-							dst := filepath.Join(targetDir, f.Name())
-							os.Rename(src, dst)
-						}
-					} else {
-						// multiple files: move everything
-						for _, f := range entries {
-							src := filepath.Join(tmpExtract, f.Name())
-							dst := filepath.Join(targetDir, f.Name())
-							os.Rename(src, dst)
-						}
-					}
-
-					os.RemoveAll(tmpExtract)
-					log.Printf("[%s] deploy: site available at %s (user=%s site=%s)\n",
-						n.ID, targetDir, user, site)
-				}(user, site, fileURL)
+				}()
 			}
 		}
 
@@ -359,6 +345,33 @@ func (n *RaftNode) applyEntries() {
 		case n.applyCh <- entry:
 		default:
 			go func(en LogEntry) { n.applyCh <- en }(entry)
+		}
+	}
+}
+
+func copyDir(src, dst string) {
+	entries, _ := os.ReadDir(src)
+	for _, e := range entries {
+		srcPath := filepath.Join(src, e.Name())
+		dstPath := filepath.Join(dst, e.Name())
+		if e.IsDir() {
+			os.MkdirAll(dstPath, 0o755)
+			copyDir(srcPath, dstPath)
+		} else {
+			in, err1 := os.Open(srcPath)
+			if err1 != nil {
+				log.Printf("copyDir open %s: %v", srcPath, err1)
+				continue
+			}
+			out, err2 := os.Create(dstPath)
+			if err2 != nil {
+				in.Close()
+				log.Printf("copyDir create %s: %v", dstPath, err2)
+				continue
+			}
+			io.Copy(out, in)
+			in.Close()
+			out.Close()
 		}
 	}
 }
